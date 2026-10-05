@@ -1,0 +1,24 @@
+id = "restart-agents"
+name = "Restart Agents"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Restart the agent in the focused pane, or every agent in every pane, resuming the same session."
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "restart-current"
+title = "Restart agent in focused pane"
+contexts = ["pane", "workspace", "global"]
+command = ["python3", "restart.py", "current"]
+
+[[actions]]
+id = "restart-all"
+title = "Restart all agents"
+contexts = ["workspace", "global"]
+command = ["python3", "restart.py", "open-confirm"]
+
+[[panes]]
+id = "confirm-all"
+title = "Restart all agents"
+placement = "overlay"
+command = ["python3", "restart.py", "all-ui"]
