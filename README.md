@@ -5,11 +5,20 @@ A Herdr plugin that restarts coding agents in their panes and resumes the same s
 ## Actions
 
 - `restart-agents.restart-current` restarts the agent in the focused pane.
-- `restart-agents.restart-all` opens a confirmation window, then restarts every agent. Agents in the `working` or `blocked` state are skipped.
+- `restart-agents.restart-all` opens a selection window, then restarts the selected agents. Agents in the `working` or `blocked` state are skipped.
 - `restart-agents.restart-current-update` does the same as `restart-current`, but updates the agent before resuming it.
-- `restart-agents.restart-all-update` does the same as `restart-all` (with the same confirmation window), but updates the agents before resuming them.
+- `restart-agents.restart-all-update` does the same as `restart-all` (with the same selection window), but updates the agents before resuming them.
 
 For each pane the plugin reads the agent's launch command and session id, asks the agent to exit, waits until the pane is back at the shell, then runs the same command with the agent's resume flag. Any session-selecting flags in the old command (`--resume`, `-r`, `--continue`, `-c`, `--session`, `--conversation`, `--session-id`) are dropped first; other flags such as `-n <name>` are kept.
+
+## Selection window
+
+`restart-all` and `restart-all-update` open a list of all agents (workspace / tab, agent kind, status). All agents that are not `working` or `blocked` are marked `[x]` at the start. Commands at the prompt:
+
+- numbers or ranges (`1 3 5-7`) toggle those agents;
+- `a` selects all, `n` clears the selection;
+- `t` leaves only the agents of the current tab, `w` only those of the current workspace;
+- Enter starts the restart, `q` cancels.
 
 ## Restart with update
 
@@ -64,8 +73,8 @@ Check that these keys are not already used in your config.
 ## Limitations
 
 - Tested on Claude Code (including sessions started with `--session-id`), Antigravity and OpenCode. The other agents in the table were not tested.
-- `restart-all` as a whole and its confirmation window were not tested, and neither were the key bindings above. The per-pane restart that both actions share was tested.
-- The update variants were tested on Claude Code in a single pane: successful update, failed update (old version resumed) and an agent kind without an update command. Not tested: `restart-all-update` with several panes, the confirmation window of the update variant, the plugin actions themselves, and the update commands of Antigravity, OpenCode and Hermes (taken from their `--help`).
+- `restart-all` as a whole and its selection window inside Herdr were not tested, and neither were the key bindings above. The selection commands were run with simulated input outside Herdr; the per-pane restart that both actions share was tested.
+- The update variants were tested on Claude Code in a single pane: successful update, failed update (old version resumed) and an agent kind without an update command. Not tested: `restart-all-update` with several panes, the plugin actions themselves, and the update commands of Antigravity, OpenCode and Hermes (taken from their `--help`).
 - After a restart, an agent name set with `herdr agent start` is lost; address the agent by pane id.
 - Agents in the `working` or `blocked` state are skipped by `restart-all`.
 

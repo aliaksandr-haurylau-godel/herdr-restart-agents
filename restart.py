@@ -248,6 +248,90 @@ def focused_pane():
     return None
 
 
+def parse_numbers(text, count):
+    """'1 3 5-7' -> {1, 3, 5, 6, 7}; raises ValueError on anything else."""
+    out = set()
+    for part in text.replace(",", " ").split():
+        lo, _, hi = part.partition("-")
+        lo, hi = int(lo), int(hi or lo)
+        if not 1 <= lo <= hi <= count:
+            raise ValueError(part)
+        out.update(range(lo, hi + 1))
+    return out
+
+
+def names(kind):
+    """id -> label for 'tab' or 'workspace'."""
+    try:
+        items = herdr(kind, "list")["result"][kind + "s"]
+        return {i[kind + "_id"]: i.get("label", "") for i in items}
+    except Exception:
+        return {}
+
+
+def current_scope(agents):
+    """(tab_id, workspace_id) of the focused agent or of the invoking pane."""
+    pane = focused_pane()
+    for a in agents:
+        if a["pane_id"] == pane:
+            return a.get("tab_id"), a.get("workspace_id")
+    return None, None
+
+
+def select_agents(agents, update):
+    """Interactive checklist; returns the agents to restart ([] if cancelled)."""
+    tabs, workspaces = names("tab"), names("workspace")
+    agents = sorted(agents, key=lambda a: (a.get("workspace_id", ""), a.get("tab_id", ""), a["pane_id"]))
+    busy = {i for i, a in enumerate(agents) if a["agent_status"] in SKIP_STATES}
+    selected = set(range(len(agents))) - busy
+    cur_tab, cur_ws = current_scope(agents)
+    verb = "Update and restart" if update else "Restart"
+    msg = ""
+    while True:
+        print("\033[2J\033[H", end="")  # redraw the list from the top
+        print(f"{verb} agents. [x] = will be restarted. Agents working/blocked are skipped.\n")
+        for i, a in enumerate(agents):
+            mark = "[-]" if i in busy else "[x]" if i in selected else "[ ]"
+            where = f"{workspaces.get(a.get('workspace_id'), '?')} / {tabs.get(a.get('tab_id'), '?')}"
+            note = f"  ({a['agent_status']}, skipped)" if i in busy else ""
+            print(f"{i + 1:3} {mark} {label_of(a)}  [{a['agent']}]  {where}{note}")
+        if update:
+            print("\nEach agent kind is updated once, then every selected pane is resumed.")
+        print("\nNumbers (1 3 5-7) toggle; a = select all; n = select none;"
+              "\nt = only this tab; w = only this workspace; Enter = go; q = cancel")
+        if msg:
+            print(f"\n{msg}")
+            msg = ""
+        try:
+            cmd = input(f"[{len(selected)} selected] > ").strip().lower()
+        except EOFError:
+            return []
+        if cmd == "q":
+            return []
+        if cmd == "":
+            if selected:
+                return [agents[i] for i in sorted(selected)]
+            msg = "Nothing selected."
+        elif cmd == "a":
+            selected = set(range(len(agents))) - busy
+        elif cmd == "n":
+            selected = set()
+        elif cmd in ("t", "w"):
+            key, cur = ("tab_id", cur_tab) if cmd == "t" else ("workspace_id", cur_ws)
+            if cur is None:
+                msg = "Current tab/workspace is unknown."
+            else:
+                selected = {i for i, a in enumerate(agents) if a.get(key) == cur} - busy
+        else:
+            try:
+                for i in parse_numbers(cmd, len(agents)):
+                    if i - 1 in busy:
+                        continue
+                    selected ^= {i - 1}
+            except ValueError:
+                msg = f"Not understood: '{cmd}'. Use numbers like 1 3 5-7, or a, n, t, w, q."
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "current"
     update = mode.endswith("-update")
@@ -263,15 +347,10 @@ def main():
         herdr("plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint",
               "confirm-all-update" if update else "confirm-all")
     elif mode == "all-ui":
-        agents = list_agents()
-        idle = [a for a in agents if a["agent_status"] not in SKIP_STATES]
-        busy = len(agents) - len(idle)
-        print(f"Agents: {len(agents)}; will restart: {len(idle)}; skipped (working/blocked): {busy}")
-        if update:
-            print("Agents will be updated first (once per agent kind), then resumed.")
-        if input("Restart all? [y/N] ").strip().lower() != "y":
-            return 0
-        print_results(restart_many(agents, update))
+        chosen = select_agents(list_agents(), update)
+        if chosen:
+            print()
+            print_results(restart_many(chosen, update))
         input("\nEnter to close")
     return 0
 
