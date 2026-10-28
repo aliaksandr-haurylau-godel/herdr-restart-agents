@@ -4,7 +4,12 @@
 Flow per pane: read the agent's launch command and session id, ask the agent to
 exit, wait until the pane is back at the shell, then run the same command with
 `--resume <session id>` (or the agent's own resume flag).
+
+With update: after the agent has exited, run the agent's self-update command in
+the same pane and wait for it, then resume. A failed update does not stop the
+resume; the old version is resumed.
 """
+import tempfile
 import json
 import os
 import shlex
@@ -16,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 PLUGIN_ID = "restart-agents"
 EXIT_TIMEOUT = 20
+UPDATE_TIMEOUT = 600
 PARALLEL = 6
 
 # agent kind -> (resume flag template, how to quit). Quit "slash" types /exit,
@@ -31,6 +37,14 @@ RESUME = {
 }
 # Flags that select a session; dropped from the old command before resuming.
 SESSION_FLAGS = {"--resume", "-r", "--continue", "-c", "--session", "--conversation", "--session-id"}
+# agent kind -> self-update command, run in the pane while the agent is stopped.
+# Kinds absent here have no verified update command and are restarted unchanged.
+UPDATE = {
+    "claude": ["claude", "update"],
+    "agy": ["agy", "update"],
+    "opencode": ["opencode", "upgrade"],
+    "hermes": ["hermes", "update", "--yes"],
+}
 SKIP_STATES = {"working", "blocked"}
 
 
@@ -91,43 +105,127 @@ def at_shell(pane, kind):
     return not any(is_agent_proc(p, kind) for p in info["foreground_processes"])
 
 
-def restart(agent):
+def stop(agent):
+    """Ask the agent to exit and wait for the shell. Returns (cmd, error)."""
     pane, kind = agent["pane_id"], agent["agent"]
-    label = agent.get("terminal_title_stripped") or pane
+    argv, _ = launch_argv(pane, kind)
+    cmd = build_command(agent, argv)
+    if RESUME[kind][1] == "slash":
+        herdr("pane", "send-text", pane, "/exit")
+        herdr("pane", "send-keys", pane, "enter")
+    else:
+        herdr("pane", "send-keys", pane, "ctrl+c")
+        time.sleep(0.4)
+        herdr("pane", "send-keys", pane, "ctrl+c")
+    deadline = time.time() + EXIT_TIMEOUT
+    while time.time() < deadline:
+        if at_shell(pane, kind):
+            return cmd, None
+        time.sleep(0.5)
+    return cmd, f"agent did not exit within {EXIT_TIMEOUT}s"
+
+
+def run_update(pane, kind):
+    """Run the update command in the pane; returns an error text or None."""
+    fd, status_file = tempfile.mkstemp(prefix="restart-agents-")
+    os.close(fd)
+    os.unlink(status_file)
+    # sh -c keeps this independent of the pane's shell (fish has no $?).
+    script = f"{shlex.join(UPDATE[kind])}; echo $? > {shlex.quote(status_file)}"
+    try:
+        herdr("pane", "run", pane, shlex.join(["sh", "-c", script]))
+        deadline = time.time() + UPDATE_TIMEOUT
+        while time.time() < deadline:
+            if os.path.exists(status_file):
+                time.sleep(0.2)
+                code = open(status_file).read().strip()
+                return None if code == "0" else f"'{shlex.join(UPDATE[kind])}' exited with {code}"
+            time.sleep(0.5)
+        return f"update did not finish within {UPDATE_TIMEOUT}s"
+    finally:
+        if os.path.exists(status_file):
+            os.unlink(status_file)
+
+
+def update_note(kind, err):
+    if kind not in UPDATE:
+        return f"update not supported for '{kind}'"
+    return f"update failed: {err}" if err else "updated"
+
+
+def resume(agent, cmd, note):
+    herdr("pane", "run", agent["pane_id"], shlex.join(cmd))
+    detail = shlex.join(cmd)
+    return agent["pane_id"], label_of(agent), "restarted", f"{note}; {detail}" if note else detail
+
+
+def label_of(agent):
+    return agent.get("terminal_title_stripped") or agent["pane_id"]
+
+
+def restart(agent, update=False):
+    pane, kind = agent["pane_id"], agent["agent"]
+    label = label_of(agent)
     if agent["agent_status"] in SKIP_STATES:
         return pane, label, "skipped", f"agent is {agent['agent_status']}"
     try:
-        argv, _ = launch_argv(pane, kind)
-        cmd = build_command(agent, argv)
-        quit_mode = RESUME[kind][1]
-        if quit_mode == "slash":
-            herdr("pane", "send-text", pane, "/exit")
-            herdr("pane", "send-keys", pane, "enter")
-        else:
-            herdr("pane", "send-keys", pane, "ctrl+c")
-            time.sleep(0.4)
-            herdr("pane", "send-keys", pane, "ctrl+c")
-        deadline = time.time() + EXIT_TIMEOUT
-        while time.time() < deadline:
-            if at_shell(pane, kind):
-                break
-            time.sleep(0.5)
-        else:
-            return pane, label, "failed", f"agent did not exit within {EXIT_TIMEOUT}s"
-        herdr("pane", "run", pane, shlex.join(cmd))
-        return pane, label, "restarted", shlex.join(cmd)
+        cmd, err = stop(agent)
+        if err:
+            return pane, label, "failed", err
+        note = None
+        if update:
+            note = update_note(kind, run_update(pane, kind) if kind in UPDATE else None)
+        return resume(agent, cmd, note)
     except Exception as e:  # report per pane, keep going with the others
         return pane, label, "failed", str(e)
 
 
-def restart_many(agents):
+def restart_many(agents, update=False):
+    if not update:
+        with ThreadPoolExecutor(max_workers=PARALLEL) as ex:
+            return list(ex.map(restart, agents))
+    # With update: stop every pane, update each agent kind once (in the first
+    # stopped pane of that kind), then resume all panes.
+    def stop_one(agent):
+        if agent["agent_status"] in SKIP_STATES:
+            return agent, None, f"agent is {agent['agent_status']}", True
+        try:
+            cmd, err = stop(agent)
+            return agent, cmd, err, False
+        except Exception as e:
+            return agent, None, str(e), False
+
     with ThreadPoolExecutor(max_workers=PARALLEL) as ex:
-        return list(ex.map(restart, agents))
+        stopped = list(ex.map(stop_one, agents))
+    first_pane, notes = {}, {}
+    for agent, cmd, err, _ in stopped:
+        if not err:
+            first_pane.setdefault(agent["agent"], agent["pane_id"])
+    updatable = [k for k in first_pane if k in UPDATE]
+    with ThreadPoolExecutor(max_workers=PARALLEL) as ex:
+        errs = dict(zip(updatable, ex.map(lambda k: run_update(first_pane[k], k), updatable)))
+    for kind in first_pane:
+        notes[kind] = update_note(kind, errs.get(kind))
+
+    def resume_one(item):
+        agent, cmd, err, skipped = item
+        pane, label = agent["pane_id"], label_of(agent)
+        if skipped:
+            return pane, label, "skipped", err
+        if err:
+            return pane, label, "failed", err
+        try:
+            return resume(agent, cmd, notes[agent["agent"]])
+        except Exception as e:
+            return pane, label, "failed", str(e)
+
+    with ThreadPoolExecutor(max_workers=PARALLEL) as ex:
+        return list(ex.map(resume_one, stopped))
 
 
 def print_results(results):
     for pane, label, status, detail in results:
-        print(f"{status:10} {pane:8} {label}  {detail if status != 'restarted' else ''}")
+        print(f"{status:10} {pane:8} {label}  {detail}")
     n = sum(r[2] == "restarted" for r in results)
     print(f"\nrestarted {n} of {len(results)}")
 
@@ -152,23 +250,28 @@ def focused_pane():
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "current"
+    update = mode.endswith("-update")
+    mode = mode.removesuffix("-update")
     if mode == "current":
         pane = focused_pane()
         agent = next((a for a in list_agents() if a["pane_id"] == pane), None)
         if not agent:
             print("no agent in the focused pane")
             return 1
-        print_results([restart(agent)])
+        print_results([restart(agent, update)])
     elif mode == "open-confirm":
-        herdr("plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", "confirm-all")
+        herdr("plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint",
+              "confirm-all-update" if update else "confirm-all")
     elif mode == "all-ui":
         agents = list_agents()
         idle = [a for a in agents if a["agent_status"] not in SKIP_STATES]
         busy = len(agents) - len(idle)
         print(f"Agents: {len(agents)}; will restart: {len(idle)}; skipped (working/blocked): {busy}")
+        if update:
+            print("Agents will be updated first (once per agent kind), then resumed.")
         if input("Restart all? [y/N] ").strip().lower() != "y":
             return 0
-        print_results(restart_many(agents))
+        print_results(restart_many(agents, update))
         input("\nEnter to close")
     return 0
 

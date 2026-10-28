@@ -22,3 +22,21 @@ id = "confirm-all"
 title = "Restart all agents"
 placement = "overlay"
 command = ["python3", "restart.py", "all-ui"]
+
+[[actions]]
+id = "restart-current-update"
+title = "Update and restart agent in focused pane"
+contexts = ["pane", "workspace", "global"]
+command = ["python3", "restart.py", "current-update"]
+
+[[actions]]
+id = "restart-all-update"
+title = "Update and restart all agents"
+contexts = ["workspace", "global"]
+command = ["python3", "restart.py", "open-confirm-update"]
+
+[[panes]]
+id = "confirm-all-update"
+title = "Update and restart all agents"
+placement = "overlay"
+command = ["python3", "restart.py", "all-ui-update"]
